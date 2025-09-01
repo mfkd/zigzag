@@ -1,4 +1,5 @@
-const clap = @import("clap");
+const builtin = @import("builtin");
+const clap = if (builtin.is_test) struct {} else @import("clap");
 const std = @import("std");
 const writer = std.io.getStdOut().writer();
 
@@ -134,43 +135,47 @@ fn writeGPX(gpx: GPX, file_path: []const u8) !void {
     var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
     defer file.close();
 
-    var xml_writer = file.writer();
-
-    try xml_writer.print(
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<gpx version="{s}" creator="{s}" xmlns="http://www.topografix.com/GPX/1/1">
-        \\  <metadata>
-        \\    <name>{s}</name>
-        \\  </metadata>
-        \\
-    , .{ gpx.version, gpx.creator, gpx.name.? });
+    var buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(
+        &buf,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+            "<gpx version=\"{s}\" creator=\"{s}\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n" ++
+            "  <metadata>\n" ++
+            "    <name>{s}</name>\n" ++
+            "  </metadata>\n",
+        .{ gpx.version, gpx.creator, gpx.name.? },
+    );
+    try file.writeAll(header);
 
     for (gpx.tracks) |track_entry| {
-        try xml_writer.writeAll("  <trk>\n");
+        try file.writeAll("  <trk>\n");
         if (track_entry.name) |track_name| {
-            try xml_writer.print("    <name>{s}</name>\n", .{track_name});
+            const nm = try std.fmt.bufPrint(&buf, "    <name>{s}</name>\n", .{track_name});
+            try file.writeAll(nm);
         }
 
         for (track_entry.segments) |segment| {
-            try xml_writer.writeAll("    <trkseg>\n");
+            try file.writeAll("    <trkseg>\n");
 
             for (segment.points) |point| {
-                try xml_writer.print("      <trkpt lat=\"{d:.6}\" lon=\"{d:.6}\">\n", .{ point.latitude, point.longitude });
+                const pt = try std.fmt.bufPrint(&buf, "      <trkpt lat=\"{d:.6}\" lon=\"{d:.6}\">\n", .{ point.latitude, point.longitude });
+                try file.writeAll(pt);
 
                 if (point.elevation) |elevation| {
-                    try xml_writer.print("        <ele>{d:.1}</ele>\n", .{elevation});
+                    const el = try std.fmt.bufPrint(&buf, "        <ele>{d:.1}</ele>\n", .{elevation});
+                    try file.writeAll(el);
                 }
 
-                try xml_writer.writeAll("      </trkpt>\n");
+                try file.writeAll("      </trkpt>\n");
             }
 
-            try xml_writer.writeAll("    </trkseg>\n");
+            try file.writeAll("    </trkseg>\n");
         }
 
-        try xml_writer.writeAll("  </trk>\n");
+        try file.writeAll("  </trk>\n");
     }
 
-    try xml_writer.writeAll("</gpx>\n");
+    try file.writeAll("</gpx>\n");
 
     std.debug.print("GPX file written to: {s}\n", .{file_path});
 }
@@ -212,9 +217,11 @@ fn convertJsonToTrack(json: std.json.Value, allocator: std.mem.Allocator) !Track
         }
     }
 
-    var segments = [1]Segment{.{ .points = points }};
+    // Allocate segments to ensure lifetime outlives this function.
+    var segments = try allocator.alloc(Segment, 1);
+    segments[0] = .{ .points = points };
 
-    return Track{ .name = track_name, .segments = &segments };
+    return Track{ .name = track_name, .segments = segments };
 }
 
 fn fetchTrackHtml(url: []const u8, allocator: std.mem.Allocator) ![]u8 {
@@ -259,4 +266,80 @@ pub fn main() !void {
         }
         std.process.exit(1);
     };
+}
+
+const testing = std.testing;
+
+test "writeGPX produces expected XML with points" {
+    const allocator = testing.allocator;
+
+    // Prepare sample points and track
+    var points = try allocator.alloc(Point, 2);
+    defer allocator.free(points);
+    points[0] = .{ .latitude = 12.345, .longitude = -98.765 };
+    points[1] = .{ .latitude = 0.0, .longitude = 1.0, .elevation = 10.5 };
+
+    var segments = try allocator.alloc(Segment, 1);
+    defer allocator.free(segments);
+    segments[0] = .{ .points = points };
+
+    const track = Track{ .name = "Test Track", .segments = segments };
+    const gpx = try gpxFromTrack(track, allocator);
+    defer allocator.free(gpx.tracks);
+
+    // Ensure output directory exists
+    std.fs.cwd().makeDir("zig-cache") catch {};
+    const out_path = "zig-cache/test-output.gpx";
+    // Write and verify file
+    try writeGPX(gpx, out_path);
+
+    // Read file back
+    const data = try std.fs.cwd().readFileAlloc(allocator, out_path, 2 * 1024 * 1024);
+    defer allocator.free(data);
+    // Best-effort cleanup
+    std.fs.cwd().deleteFile(out_path) catch {};
+
+    try testing.expect(std.mem.indexOf(u8, data, "<gpx version=\"1.1\" creator=\"zigzag\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "<name>Test Track</name>") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "<trkpt lat=\"12.345000\" lon=\"-98.765000\">") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "<ele>10.5</ele>") != null);
+}
+
+test "convertJsonToTrack from JSON value" {
+    const allocator = testing.allocator;
+    const json_str =
+        "{\"page\":{\"_embedded\":{\"tour\":{\"name\":\"My Tour\",\"_embedded\":{\"coordinates\":{\"items\":[{\"lat\":1.1,\"lng\":2.2,\"alt\":5.0},{\"lat\":3.3,\"lng\":4.4}]}}}}}}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer {
+        parsed.arena.deinit();
+        allocator.destroy(parsed.arena);
+    }
+    const json_val = parsed.value;
+
+    const track = try convertJsonToTrack(json_val, allocator);
+    defer allocator.free(track.segments);
+    defer allocator.free(track.segments[0].points);
+    try testing.expect(track.name != null);
+    try testing.expect(std.mem.eql(u8, track.name.?, "My Tour"));
+    try testing.expect(track.segments.len == 1);
+    try testing.expect(track.segments[0].points.len == 2);
+    try testing.expect(track.segments[0].points[0].elevation != null);
+    try testing.expect(track.segments[0].points[1].elevation == null);
+    try testing.expect(track.segments[0].points[0].latitude == 1.1);
+    try testing.expect(track.segments[0].points[0].longitude == 2.2);
+    try testing.expect(track.segments[0].points[1].latitude == 3.3);
+    try testing.expect(track.segments[0].points[1].longitude == 4.4);
+}
+
+test "sample GPX file exists and has root tags" {
+    const allocator = testing.allocator;
+    var file = try std.fs.cwd().openFile("miut-115-2023.gpx", .{});
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 2 * 1024 * 1024);
+    defer allocator.free(data);
+
+    try testing.expect(std.mem.indexOf(u8, data, "<gpx ") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "creator=\"komootgpx\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "</gpx>") != null);
 }
