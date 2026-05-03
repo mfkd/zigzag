@@ -9,7 +9,7 @@ Zig version of [komootgpx](https://github.com/mfkd/komootgpx).
 Ensure you have Zig installed, then build:
 
 ```sh
-zig build -Drelease-fast
+zig build --release=fast
 ```
 
 ## Usage

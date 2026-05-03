@@ -1,25 +1,21 @@
-const builtin = @import("builtin");
-const clap = if (builtin.is_test) struct {} else @import("clap");
 const std = @import("std");
-const writer = std.io.getStdOut().writer();
+const Io = std.Io;
+const testing = std.testing;
 
-/// AppError represents the possible errors that can occur
 const AppError = error{
     HTTPStatusNotOK,
-    ParseErrorNotFound,
+    HelpRequested,
     MissingCommand,
-    FileWriteError,
-    MissingOutput,
-    MissingURL,
+    MissingValue,
+    ParseErrorNotFound,
+    UnknownArgument,
 };
 
-/// Args represents the command line arguments
 const Args = struct {
     url: []const u8,
     output: []const u8,
 };
 
-/// GPX represents the root GPX element
 const GPX = struct {
     version: []const u8,
     creator: []const u8,
@@ -27,83 +23,114 @@ const GPX = struct {
     tracks: []Track,
 };
 
-/// Track represents a GPX track
 const Track = struct {
     name: ?[]const u8 = null,
     segments: []Segment,
 };
 
-/// Segment represents a track segment
 const Segment = struct {
     points: []Point,
 };
 
-/// Point represents a track point with attributes
 const Point = struct {
     latitude: f64,
     longitude: f64,
     elevation: ?f64 = null,
 };
 
-fn parseArgs(
-    allocator: std.mem.Allocator,
-) !Args {
-    const params = comptime clap.parseParamsComptime(
-        \\-u, --url <str>...     URL of komoot track
-        \\-o, --output <str>...  GPX Outputfile
+fn printUsage(writer: *Io.Writer) !void {
+    try writer.writeAll(
+        \\Usage: zigzag -u <komoot-url> -o <output.gpx>
+        \\
+        \\Options:
+        \\  -u, --url <url>       URL of Komoot tour
+        \\  -o, --output <path>   GPX output file
+        \\  -h, --help            Print this help and exit
         \\
     );
+}
 
-    var diag = clap.Diagnostic{};
-    const res = clap.parse(clap.Help, &params, clap.parsers.default, .{
-        .diagnostic = &diag,
-        .allocator = allocator,
-    }) catch |err| {
-        // Report useful error and exit.
-        diag.report(std.io.getStdErr().writer(), err) catch {};
-        return err;
-    };
+fn printStderr(io: Io, comptime fmt: []const u8, args: anytype) !void {
+    var buffer: [1024]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writerStreaming(io, &buffer);
+    try stderr_writer.interface.print(fmt, args);
+    try stderr_writer.flush();
+}
 
-    // Check for missing arguments
-    var missing: []const u8 = "";
-    if (res.args.output.len == 0) missing = "--output";
-    if (res.args.url.len == 0) missing = if (missing.len > 0) "--output, --url" else "--url";
+fn printRunError(io: Io, err: anyerror) void {
+    switch (err) {
+        AppError.MissingCommand => printStderr(io, "Error: missing required --url and/or --output; see --help\n", .{}) catch {},
+        AppError.MissingValue => printStderr(io, "Error: option value missing; see --help\n", .{}) catch {},
+        AppError.UnknownArgument => printStderr(io, "Error: unknown argument; see --help\n", .{}) catch {},
+        else => printStderr(io, "Failed to run: {s}\n", .{@errorName(err)}) catch {},
+    }
+}
 
-    if (missing.len > 0) {
-        std.debug.print("Error: Missing required argument(s): {s}\n", .{missing});
+fn valueForOption(argv: []const [:0]const u8, index: *usize) ![]const u8 {
+    index.* += 1;
+    if (index.* >= argv.len) {
+        return AppError.MissingValue;
+    }
+    return argv[index.*];
+}
+
+fn parseArgs(argv: []const [:0]const u8) !Args {
+    var url: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return AppError.HelpRequested;
+        } else if (std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--url")) {
+            url = try valueForOption(argv, &i);
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            output = try valueForOption(argv, &i);
+        } else {
+            return AppError.UnknownArgument;
+        }
+    }
+
+    if (url == null or output == null) {
         return AppError.MissingCommand;
     }
 
     return .{
-        .url = res.args.url[0],
-        .output = res.args.output[0],
+        .url = url.?,
+        .output = output.?,
     };
 }
 
 fn get(
+    io: Io,
     url: []const u8,
     headers: []const std.http.Header,
     client: *std.http.Client,
     allocator: std.mem.Allocator,
-) !std.ArrayList(u8) {
-    var response_body = std.ArrayList(u8).init(allocator);
+) ![]u8 {
+    var response_body: std.ArrayList(u8) = .empty;
+    var response_writer = Io.Writer.Allocating.fromArrayList(allocator, &response_body);
+    defer response_writer.deinit();
 
     const response = try client.fetch(.{
         .method = .GET,
         .location = .{ .url = url },
         .extra_headers = headers,
-        .response_storage = .{ .dynamic = &response_body },
+        .response_writer = &response_writer.writer,
     });
 
-    if (response.status != std.http.Status.ok) {
-        try writer.print("Response Status: {d}\n", .{response.status});
+    if (response.status != .ok) {
+        printStderr(io, "Response Status: {d}\n", .{@intFromEnum(response.status)}) catch {};
         return AppError.HTTPStatusNotOK;
     }
 
-    return response_body;
+    response_body = response_writer.toArrayList();
+    errdefer response_body.deinit(allocator);
+    return response_body.toOwnedSlice(allocator);
 }
 
-fn parseJsonFromHtml(html: []u8, allocator: std.mem.Allocator) !std.json.Value {
+fn parseJsonFromHtml(html: []const u8, allocator: std.mem.Allocator) !std.json.Value {
     const start_marker = "kmtBoot.setProps(\"";
     const end_marker = "\");";
 
@@ -116,14 +143,14 @@ fn parseJsonFromHtml(html: []u8, allocator: std.mem.Allocator) !std.json.Value {
     json = try std.mem.replaceOwned(u8, allocator, json, "\\\\", "\\");
     json = try std.mem.replaceOwned(u8, allocator, json, "\\\"", "\"");
 
-    return (try std.json.parseFromSlice(std.json.Value, allocator, json, .{})).value;
+    return try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
 }
 
 fn gpxFromTrack(track: Track, allocator: std.mem.Allocator) !GPX {
-    var tracks = try allocator.alloc(Track, 1);
+    const tracks = try allocator.alloc(Track, 1);
     tracks[0] = track;
 
-    return GPX{
+    return .{
         .version = "1.1",
         .creator = "zigzag",
         .name = track.name,
@@ -131,101 +158,100 @@ fn gpxFromTrack(track: Track, allocator: std.mem.Allocator) !GPX {
     };
 }
 
-fn writeGPX(gpx: GPX, file_path: []const u8) !void {
-    var file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
-    defer file.close();
+fn createOutputFile(io: Io, file_path: []const u8) !Io.File {
+    if (std.fs.path.isAbsolute(file_path)) {
+        return Io.Dir.createFileAbsolute(io, file_path, .{ .truncate = true });
+    }
+    return Io.Dir.cwd().createFile(io, file_path, .{ .truncate = true });
+}
 
-    var buf: [512]u8 = undefined;
-    const header = try std.fmt.bufPrint(
-        &buf,
+fn writeGPX(io: Io, gpx: GPX, file_path: []const u8) !void {
+    var file = try createOutputFile(io, file_path);
+    defer file.close(io);
+
+    var buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &buffer);
+    const writer = &file_writer.interface;
+
+    try writer.print(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
             "<gpx version=\"{s}\" creator=\"{s}\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n" ++
             "  <metadata>\n" ++
             "    <name>{s}</name>\n" ++
             "  </metadata>\n",
-        .{ gpx.version, gpx.creator, gpx.name.? },
+        .{ gpx.version, gpx.creator, gpx.name orelse "Unknown" },
     );
-    try file.writeAll(header);
 
     for (gpx.tracks) |track_entry| {
-        try file.writeAll("  <trk>\n");
+        try writer.writeAll("  <trk>\n");
         if (track_entry.name) |track_name| {
-            const nm = try std.fmt.bufPrint(&buf, "    <name>{s}</name>\n", .{track_name});
-            try file.writeAll(nm);
+            try writer.print("    <name>{s}</name>\n", .{track_name});
         }
 
         for (track_entry.segments) |segment| {
-            try file.writeAll("    <trkseg>\n");
+            try writer.writeAll("    <trkseg>\n");
 
             for (segment.points) |point| {
-                const pt = try std.fmt.bufPrint(&buf, "      <trkpt lat=\"{d:.6}\" lon=\"{d:.6}\">\n", .{ point.latitude, point.longitude });
-                try file.writeAll(pt);
+                try writer.print("      <trkpt lat=\"{d:.6}\" lon=\"{d:.6}\">\n", .{ point.latitude, point.longitude });
 
                 if (point.elevation) |elevation| {
-                    const el = try std.fmt.bufPrint(&buf, "        <ele>{d:.1}</ele>\n", .{elevation});
-                    try file.writeAll(el);
+                    try writer.print("        <ele>{d:.1}</ele>\n", .{elevation});
                 }
 
-                try file.writeAll("      </trkpt>\n");
+                try writer.writeAll("      </trkpt>\n");
             }
 
-            try file.writeAll("    </trkseg>\n");
+            try writer.writeAll("    </trkseg>\n");
         }
 
-        try file.writeAll("  </trk>\n");
+        try writer.writeAll("  </trk>\n");
     }
 
-    try file.writeAll("</gpx>\n");
+    try writer.writeAll("</gpx>\n");
+    try file_writer.flush();
+}
 
-    std.debug.print("GPX file written to: {s}\n", .{file_path});
+fn jsonNumber(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .float => |float| float,
+        .integer => |integer| @floatFromInt(integer),
+        else => null,
+    };
 }
 
 fn convertJsonToTrack(json: std.json.Value, allocator: std.mem.Allocator) !Track {
-    const track_name_entry = json.object.get("page").?
+    const tour = json.object.get("page").?
         .object.get("_embedded").?
-        .object.get("tour").?
-        .object.get("name");
-    const track_name = if (track_name_entry) |n| n.string else "Unknown";
+        .object.get("tour").?;
 
-    const coordinate_items = json.object.get("page").?
-        .object.get("_embedded").?
-        .object.get("tour").?
-        .object.get("_embedded").?
+    const track_name = if (tour.object.get("name")) |name| name.string else "Unknown";
+    const coordinate_items = tour.object.get("_embedded").?
         .object.get("coordinates").?
         .object.get("items");
 
-    var points: []Point = undefined;
+    const coordinates = if (coordinate_items) |items| items.array.items else &[_]std.json.Value{};
+    const points = try allocator.alloc(Point, coordinates.len);
 
-    if (coordinate_items) |coordinates_json| {
-        points = try allocator.alloc(Point, coordinates_json.array.items.len);
-        for (coordinates_json.array.items, 0..) |geo_point, i| {
-            const altitude_entry = geo_point.object.get("alt");
-            const elevation = if (altitude_entry) |alt|
-                switch (alt) {
-                    .float => alt.float,
-                    .integer => @as(f64, @floatFromInt(alt.integer)),
-                    else => null,
-                }
-            else
-                null;
-
-            points[i] = Point{
-                .latitude = geo_point.object.get("lat").?.float,
-                .longitude = geo_point.object.get("lng").?.float,
-                .elevation = elevation,
-            };
-        }
+    for (coordinates, 0..) |geo_point, i| {
+        const elevation = if (geo_point.object.get("alt")) |alt| jsonNumber(alt) else null;
+        points[i] = .{
+            .latitude = jsonNumber(geo_point.object.get("lat").?).?,
+            .longitude = jsonNumber(geo_point.object.get("lng").?).?,
+            .elevation = elevation,
+        };
     }
 
-    // Allocate segments to ensure lifetime outlives this function.
-    var segments = try allocator.alloc(Segment, 1);
+    const segments = try allocator.alloc(Segment, 1);
     segments[0] = .{ .points = points };
 
-    return Track{ .name = track_name, .segments = segments };
+    return .{ .name = track_name, .segments = segments };
 }
 
-fn fetchTrackHtml(url: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    var client = std.http.Client{ .allocator = allocator };
+fn fetchTrackHtml(io: Io, url: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
 
     const headers = &[_]std.http.Header{
@@ -233,53 +259,64 @@ fn fetchTrackHtml(url: []const u8, allocator: std.mem.Allocator) ![]u8 {
         .{ .name = "User-Agent", .value = "Mozilla/5.0" },
     };
 
-    return (try get(url, headers, &client, allocator)).items;
+    return try get(io, url, headers, &client, allocator);
 }
 
-fn run(allocator: std.mem.Allocator) !void {
-    const args = try parseArgs(allocator);
-
-    const html = try fetchTrackHtml(args.url, allocator);
-
+fn run(io: Io, allocator: std.mem.Allocator, argv: []const [:0]const u8, stdout: *Io.Writer) !void {
+    const args = try parseArgs(argv);
+    const html = try fetchTrackHtml(io, args.url, allocator);
     const json = try parseJsonFromHtml(html, allocator);
-
     const track = try convertJsonToTrack(json, allocator);
-
     const gpx = try gpxFromTrack(track, allocator);
-    try writeGPX(gpx, args.output);
 
-    try writer.print("Successfully created GPX file. Track name: {?s}\n", .{track.name});
+    try writeGPX(io, gpx, args.output);
+    try stdout.print("Successfully created GPX file. Track name: {?s}\n", .{track.name});
 }
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
 
-    run(arena.allocator()) catch |err| {
-        // Print to stderr instead of stdout
-        std.debug.print("Failed to run: {s}\n", .{@errorName(err)});
-        if (std.debug.runtime_safety) {
-            // In debug builds, print the stack trace if available
-            if (@errorReturnTrace()) |trace| {
-                std.debug.dumpStackTrace(trace.*);
-            }
-        }
-        std.process.exit(1);
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
+
+    run(io, arena, argv, &stdout_writer.interface) catch |err| switch (err) {
+        AppError.HelpRequested => {
+            try printUsage(&stdout_writer.interface);
+            return stdout_writer.flush();
+        },
+        else => {
+            printRunError(io, err);
+            std.process.exit(1);
+        },
     };
+
+    try stdout_writer.flush();
 }
 
-const testing = std.testing;
+test "parseArgs accepts required flags" {
+    const argv = [_][:0]const u8{ "zigzag", "-u", "https://example.com/tour", "-o", "out.gpx" };
+    const args = try parseArgs(&argv);
+
+    try testing.expectEqualStrings("https://example.com/tour", args.url);
+    try testing.expectEqualStrings("out.gpx", args.output);
+}
+
+test "parseArgs reports missing required flags" {
+    const argv = [_][:0]const u8{"zigzag"};
+    try testing.expectError(AppError.MissingCommand, parseArgs(&argv));
+}
 
 test "writeGPX produces expected XML with points" {
     const allocator = testing.allocator;
 
-    // Prepare sample points and track
-    var points = try allocator.alloc(Point, 2);
+    const points = try allocator.alloc(Point, 2);
     defer allocator.free(points);
     points[0] = .{ .latitude = 12.345, .longitude = -98.765 };
     points[1] = .{ .latitude = 0.0, .longitude = 1.0, .elevation = 10.5 };
 
-    var segments = try allocator.alloc(Segment, 1);
+    const segments = try allocator.alloc(Segment, 1);
     defer allocator.free(segments);
     segments[0] = .{ .points = points };
 
@@ -287,17 +324,13 @@ test "writeGPX produces expected XML with points" {
     const gpx = try gpxFromTrack(track, allocator);
     defer allocator.free(gpx.tracks);
 
-    // Ensure output directory exists
-    std.fs.cwd().makeDir("zig-cache") catch {};
+    Io.Dir.cwd().createDirPath(testing.io, "zig-cache") catch {};
     const out_path = "zig-cache/test-output.gpx";
-    // Write and verify file
-    try writeGPX(gpx, out_path);
+    try writeGPX(testing.io, gpx, out_path);
 
-    // Read file back
-    const data = try std.fs.cwd().readFileAlloc(allocator, out_path, 2 * 1024 * 1024);
+    const data = try Io.Dir.cwd().readFileAlloc(testing.io, out_path, allocator, Io.Limit.limited(2 * 1024 * 1024));
     defer allocator.free(data);
-    // Best-effort cleanup
-    std.fs.cwd().deleteFile(out_path) catch {};
+    Io.Dir.cwd().deleteFile(testing.io, out_path) catch {};
 
     try testing.expect(std.mem.indexOf(u8, data, "<gpx version=\"1.1\" creator=\"zigzag\"") != null);
     try testing.expect(std.mem.indexOf(u8, data, "<name>Test Track</name>") != null);
@@ -310,33 +343,27 @@ test "convertJsonToTrack from JSON value" {
     const json_str =
         "{\"page\":{\"_embedded\":{\"tour\":{\"name\":\"My Tour\",\"_embedded\":{\"coordinates\":{\"items\":[{\"lat\":1.1,\"lng\":2.2,\"alt\":5.0},{\"lat\":3.3,\"lng\":4.4}]}}}}}}";
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
-    defer {
-        parsed.arena.deinit();
-        allocator.destroy(parsed.arena);
-    }
-    const json_val = parsed.value;
+    defer parsed.deinit();
 
-    const track = try convertJsonToTrack(json_val, allocator);
+    const track = try convertJsonToTrack(parsed.value, allocator);
     defer allocator.free(track.segments);
     defer allocator.free(track.segments[0].points);
+
     try testing.expect(track.name != null);
-    try testing.expect(std.mem.eql(u8, track.name.?, "My Tour"));
-    try testing.expect(track.segments.len == 1);
-    try testing.expect(track.segments[0].points.len == 2);
+    try testing.expectEqualStrings("My Tour", track.name.?);
+    try testing.expectEqual(@as(usize, 1), track.segments.len);
+    try testing.expectEqual(@as(usize, 2), track.segments[0].points.len);
     try testing.expect(track.segments[0].points[0].elevation != null);
     try testing.expect(track.segments[0].points[1].elevation == null);
-    try testing.expect(track.segments[0].points[0].latitude == 1.1);
-    try testing.expect(track.segments[0].points[0].longitude == 2.2);
-    try testing.expect(track.segments[0].points[1].latitude == 3.3);
-    try testing.expect(track.segments[0].points[1].longitude == 4.4);
+    try testing.expectEqual(@as(f64, 1.1), track.segments[0].points[0].latitude);
+    try testing.expectEqual(@as(f64, 2.2), track.segments[0].points[0].longitude);
+    try testing.expectEqual(@as(f64, 3.3), track.segments[0].points[1].latitude);
+    try testing.expectEqual(@as(f64, 4.4), track.segments[0].points[1].longitude);
 }
 
 test "sample GPX file exists and has root tags" {
     const allocator = testing.allocator;
-    var file = try std.fs.cwd().openFile("miut-115-2023.gpx", .{});
-    defer file.close();
-
-    const data = try file.readToEndAlloc(allocator, 2 * 1024 * 1024);
+    const data = try Io.Dir.cwd().readFileAlloc(testing.io, "miut-115-2023.gpx", allocator, Io.Limit.limited(2 * 1024 * 1024));
     defer allocator.free(data);
 
     try testing.expect(std.mem.indexOf(u8, data, "<gpx ") != null);
